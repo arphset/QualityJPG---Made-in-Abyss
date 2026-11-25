@@ -1,6 +1,7 @@
 import os
 import httpx
 from openai import OpenAI
+from filters.score_calculator import FILL_OK, SHARP_OK
 
 
 # Отключаем прокси
@@ -46,11 +47,14 @@ def _build_prompt(data: dict):
     fill_rate_display = _safe_fmt(fill_rate_val * 100 if fill_rate_val is not None else None, '.1f')
 
     metrics_text = (
-        f"ACF (автокорреляция, размытие): {_safe_fmt(data.get('acf_score'), '.3f')}\n"
+        f"ACF (автокорреляция, справочно, в оценку не входит): {_safe_fmt(data.get('acf_score'), '.3f')}\n"
         f"Лапласиан глобальный (текстура): {_safe_fmt(data.get('laplacian_var'), '.0f')}\n"
         f"Лапласиан локальный (медиана по блокам): {_safe_fmt(data.get('median_laplacian'), '.0f')}\n"
         f"Вариация градиента Собеля (чёткость краёв): {_safe_fmt(data.get('sobel_var'), '.0f')}\n"
         f"Индекс чёткости (0.0-1.0): {_safe_fmt(data.get('sharpness_score'), '.2f')}\n"
+        f"Ширина краёв (px, меньше — резче): {_safe_fmt(data.get('edge_width'), '.2f')}\n"
+        f"Шум (оценка σ, норма ≤ 1.6): {_safe_fmt(data.get('noise_sigma'), '.1f')}\n"
+        f"Качество JPEG (0 — не JPEG; норма ≥ 55): {_safe_fmt(data.get('jpeg_quality'), '.0f')}\n"
         f"Яркость: {_safe_fmt(data.get('brightness'), '.1f')}\n"
         f"Пересвет: {_safe_fmt(data.get('overexposed_pct'), '.1f')}%\n"
         f"Недосвет: {_safe_fmt(data.get('underexposed_pct'), '.1f')}%\n"
@@ -59,36 +63,53 @@ def _build_prompt(data: dict):
         f"Товар найден: {'Да' if data.get('object_found', True) else 'Нет'}"
     )
 
+    # Шум и качество JPEG показываются пользователю в блоке метрик, но в промпт не передаются:
+    # маленькая модель (3B) от лишних чисел чаще сбивается с формата ответа, а сами проблемы
+    # и так перечислены в списке ПРОБЛЕМЫ.
+    prompt_metrics = "\n".join(line for line in metrics_text.split("\n")
+                               if not line.startswith(("Шум", "Качество JPEG")))
+
     issues = data.get('issues', [])
     issues_text = ", ".join(issues) if issues else "Проблем не выявлено"
 
     sharpness_val = _safe_fmt(data.get('sharpness_score'), '.2f')
 
-    # Определяем вердикт по чёткости ПРЯМО в Python
-    if float(data.get('sharpness_score', 0)) > 0.7:
+    # Вердикты по чёткости и заполнению считаются в Python по тем же порогам, что и итоговая оценка
+    # (filters/score_calculator.py), чтобы текст LLM не противоречил баллу
+    try:
+        sharpness = float(data.get('sharpness_score', 0) or 0)
+    except (TypeError, ValueError):
+        sharpness = 0.0
+    if data.get('empty_frame'):
+        sharpness_verdict = "В кадре почти нет деталей, товар не виден"
+    elif sharpness >= SHARP_OK:
         sharpness_verdict = f"Фото чёткое (индекс чёткости {sharpness_val})"
-    elif float(data.get('sharpness_score', 0)) > 0.50:
-        sharpness_verdict = f"Приемлемая чёткость (индекс чёткости {sharpness_val})"
+    elif sharpness >= 0.45 and not data.get('is_blurry'):
+        sharpness_verdict = f"Чёткость приемлемая, но не идеальная (индекс чёткости {sharpness_val})"
+    elif data.get('is_motion_blur'):
+        sharpness_verdict = f"Фото смазано движением (индекс чёткости {sharpness_val})"
     else:
         sharpness_verdict = f"Фото размытое (индекс чёткости {sharpness_val})"
 
-    # Определяем комментарий по заполнению
     try:
-        fill_rate_val = float(data.get('fill_rate', 0))
+        fill_rate_val = float(data.get('fill_rate', 0) or 0)
     except (TypeError, ValueError):
         fill_rate_val = 0
 
-    if fill_rate_val >= 0.30:
-        fill_comment = "Заполнение кадра в норме (>= 30%). НЕ упоминай заполнение как проблему."
-    elif fill_rate_val >= 0.20:
-        fill_comment = f"Заполнение кадра {fill_rate_val*100:.1f}% — можно увеличить для лучшего восприятия товара."
+    if not data.get('object_found', True):
+        fill_comment = ("Главный объект автоматически не выделен (сцена, интерьер или сложный фон). "
+                        "НЕ делай выводов о заполнении кадра, можно посоветовать выделить товар крупнее.")
+    elif fill_rate_val >= FILL_OK:
+        fill_comment = f"Заполнение кадра в норме (>= {FILL_OK*100:.0f}%). НЕ упоминай заполнение как проблему."
+    elif fill_rate_val >= 0.15:
+        fill_comment = f"Заполнение кадра {fill_rate_val*100:.1f}% — товар стоит снять крупнее."
     else:
         fill_comment = f"Заполнение кадра {fill_rate_val*100:.1f}% — критически мало, товар плохо виден."
 
     prompt = f"""Ты эксперт по фотографии для маркетплейсов. Дай краткий отчёт строго по формату ниже. НЕ повторяй инструкции и метрики. НЕ пиши заголовки разделов типа "ШАБЛОН" или "ПРАВИЛА".
 
 МЕТРИКИ:
-{metrics_text}
+{prompt_metrics}
 
 ПРОБЛЕМЫ: {issues_text}
 
@@ -113,6 +134,36 @@ def _build_prompt(data: dict):
     return f"Метрики фото:\n{metrics_text}\n\n", prompt
 
 
+# Запасные советы на случай, если модель не дописала раздел «Рекомендации» (маленькая модель
+# при temperature 0.7 изредка останавливается после оценки). Ключ — фрагмент текста проблемы.
+_FALLBACK_TIPS = [
+    (("размыт", "смаз", "чёткость"), "Переснимите товар: держите камеру неподвижно или используйте опору, "
+                                     "наведите фокус на товар."),
+    (("тёмное", "темно"), "Добавьте света или увеличьте экспозицию."),
+    (("тени на фоне",), "Не снимайте против окна или солнца: свет должен падать на товар."),
+    (("засвечен", "пересвет"), "Уменьшите экспозицию и уберите прямой свет или вспышку."),
+    (("провалы в тенях",), "Подсветите тёмные участки товара (отражатель, второй источник света)."),
+    (("контраст",), "Протрите объектив и снимайте при более ярком, направленном свете."),
+    (("мало места", "смещён"), "Снимите товар крупнее и разместите его по центру кадра."),
+    (("не удалось выделить",), "Снимите товар на однородном фоне, чтобы он был главным в кадре."),
+    (("разрешение",), "Загрузите фото в исходном размере — не меньше 800 px по длинной стороне."),
+    (("сжато",), "Загрузите оригинал фото без пересжатия (не из мессенджера)."),
+    (("шум",), "Снимайте при хорошем освещении: шум появляется при нехватке света."),
+]
+
+
+def _fallback_recommendations(data: dict):
+    tips = []
+    for issue in data.get('issues', []):
+        low = issue.lower()
+        for keys, tip in _FALLBACK_TIPS:
+            if any(k in low for k in keys) and tip not in tips:
+                tips.append(tip)
+    if not tips:
+        tips = ["Фото готово к публикации."]
+    return "\n\nРекомендации:\n" + "\n".join(f"{i}. {t}" for i, t in enumerate(tips[:4], 1))
+
+
 def stream_recommendations(data: dict):
     """
     Генератор текста рекомендаций по частям (для потокового вывода в интерфейсе).
@@ -135,9 +186,13 @@ def stream_recommendations(data: dict):
             timeout=OLLAMA_TIMEOUT,
             stream=True,
         )
+        answer = []
         for chunk in stream:
             if chunk.choices and chunk.choices[0].delta.content:
+                answer.append(chunk.choices[0].delta.content)
                 yield chunk.choices[0].delta.content
+        if "Рекомендации" not in "".join(answer):
+            yield _fallback_recommendations(data)
     except Exception as e:
         yield f"\n{LLM_ERROR_PREFIX}: {str(e)}. Проверьте, запущен ли сервер."
 

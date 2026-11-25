@@ -63,6 +63,84 @@ class CvAnalysisTest(unittest.TestCase):
         self.assertLess(elapsed, 15, f"CV-анализ {size_mb:.1f} МБ занял {elapsed:.1f} с")
 
 
+def _product_on_white(dark=False):
+    """Синтетический «товар» на белом фоне: детализированная коробка с текстурой и надписью"""
+    img = np.full((1000, 1000, 3), 255, np.uint8)
+    base = 30 if dark else 140
+    # гладкий градиент (без шума: заливка случайными значениями — это и есть шум)
+    body = base + np.linspace(0, 40, 400)[None, :, None] + np.zeros((500, 1, 3))
+    img[250:750, 300:700] = np.clip(body, 0, 255).astype(np.uint8)
+    for i in range(8):
+        cv2.putText(img, f"PRODUCT {i}", (320, 300 + i * 55), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (240, 240, 240), 2)
+    cv2.rectangle(img, (300, 250), (699, 749), (base // 2, base // 2, base // 2), 6)
+    return img
+
+
+class ScoringBehaviourTest(unittest.TestCase):
+    """Оценка не зависит от цвета фона и товара, но ловит размытие, недодержку и низкое разрешение"""
+
+    def _score(self, img, ext='.jpg'):
+        from filters.score_calculator import calculate_quality_score
+        path = os.path.join(tempfile.mkdtemp(), 'photo' + ext)
+        cv2.imwrite(path, img)
+        result = analyze_image(path)
+        return result, calculate_quality_score(result)
+
+    def test_white_background_is_not_overexposure(self):
+        result, score = self._score(_product_on_white())
+        self.assertFalse(result['is_overexposed'] or result['is_bright'], score['penalties'])
+        self.assertTrue(result['object_found'])
+        self.assertGreaterEqual(score['score'], 9.0, score['penalties'])
+
+    def test_dark_product_on_white_is_not_underexposure(self):
+        result, score = self._score(_product_on_white(dark=True))
+        self.assertFalse(result['is_dark'], score['penalties'])
+        self.assertGreaterEqual(score['score'], 9.0, score['penalties'])
+
+    def test_blur_is_detected(self):
+        _, sharp = self._score(_product_on_white())
+        result, blurred = self._score(cv2.GaussianBlur(_product_on_white(), (0, 0), 3))
+        self.assertTrue(result['is_blurry'])
+        self.assertGreaterEqual(sharp['score'] - blurred['score'], 3.0)
+
+    def test_underexposure_is_detected(self):
+        img = (_product_on_white().astype(np.float32) * 0.3).astype(np.uint8)
+        result, score = self._score(img)
+        self.assertTrue(result['is_dark'], score['penalties'])
+
+    def test_low_resolution_is_penalized(self):
+        small = cv2.resize(_product_on_white(), (300, 300), interpolation=cv2.INTER_AREA)
+        _, score = self._score(small)
+        self.assertTrue(any('разрешение' in p for p in score['penalties']), score['penalties'])
+
+    def test_clean_photo_has_no_file_penalties(self):
+        _, score = self._score(_product_on_white())
+        self.assertFalse(any(w in p for p in score['penalties'] for w in ('сжатия', 'шум', 'разрешение')),
+                         score['penalties'])
+
+    def test_heavy_jpeg_compression_is_detected(self):
+        from filters.score_calculator import calculate_quality_score
+        path = os.path.join(tempfile.mkdtemp(), 'photo.jpg')
+        cv2.imwrite(path, _product_on_white(), [cv2.IMWRITE_JPEG_QUALITY, 8])
+        result = analyze_image(path)
+        self.assertTrue(result['is_compressed'], f"качество JPEG {result['jpeg_quality']:.0f}")
+
+    def test_strong_noise_is_detected(self):
+        rng = np.random.default_rng(1)
+        noisy = np.clip(_product_on_white().astype(np.float32) + rng.normal(0, 15, (1000, 1000, 3)), 0, 255)
+        result, score = self._score(noisy.astype(np.uint8))
+        self.assertTrue(result['is_noisy'], f"шум {result['noise_sigma']:.2f}")
+        self.assertTrue(any('шум' in p for p in score['penalties']), score['penalties'])
+
+    def test_transparent_png_is_read_on_white(self):
+        rgba = np.zeros((800, 800, 4), np.uint8)
+        rgba[200:600, 250:550, :3] = 90
+        rgba[200:600, 250:550, 3] = 255
+        result, score = self._score(rgba, '.png')
+        self.assertGreater(result['brightness'], 150, "прозрачный фон должен читаться как белый, а не чёрный")
+        self.assertFalse(result['is_dark'], score['penalties'])
+
+
 @unittest.skipUnless(testenv.ollama_available(), "Ollama недоступна")
 class OllamaRecommendationsTest(unittest.TestCase):
 

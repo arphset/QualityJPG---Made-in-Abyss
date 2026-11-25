@@ -31,11 +31,30 @@
 - `database/security.py` — хэш паролей PBKDF2-SHA256 (stdlib).
 - `database/init.sql` + `database/migrations/*.sql` — схема. Миграции идемпотентные, выполняются при старте
   приложения (`ensure_schema`) и при первой инициализации тома Postgres.
-- `ML&CV_Module/` — `main.analyze_image(path)`, `filters/` (blur, brightness, YOLO, score_calculator),
+- `ML&CV_Module/` — `main.analyze_image(path)`, `filters/` (blur, brightness, subject, YOLO, score_calculator),
   `ollama/ollama_access`: `stream_recommendations` (генератор: блок метрик кодом + ответ LLM потоком),
   `get_recommendations`, `warmup`. YOLO кэшируется в `filters/YOLO.get_model()` (с lock).
 - `tests/` — `run_tests.py` (unittest + streamlit AppTest, отдельная БД `qualityjpg_test`, временные uploads),
   `benchmark.py` (замер R.01.01). Протоколы → `tests/results/`.
+
+## Оценка качества (переработана 25.11.2026)
+- Все метрики — на копии с длинной стороной 1024 px (`main.WORK_SIDE`), чтобы не зависеть от разрешения.
+- Резкость (`blure_filter`): ширина краёв = перепад блока / max градиента, 25-й перцентиль по блокам с деталями
+  объекта + худшее из 4 направлений ×0.6 (смаз движения). ACF/лапласиан/Собель считаются только для отчёта и БД.
+- Объект (`subject.py`): однородный фон по краям → маска по ΔE; иначе центральный крупный бокс YOLO; иначе GrabCut.
+  `subject_confidence` < 1 → резкость по всему кадру, штраф за заполнение вдвое мягче.
+- Экспозиция (`brightness_filter`): степени 0..1 (`*_severity`); клиппинг считается внутри объекта, не по фону;
+  передержка — `highlight_pile_up` (выбитые/светлые пиксели; для сцен по всему кадру); контровой свет — только
+  при неоднородном фоне.
+- Качество файла: разрешение (нелинейно), JPEG-качество из таблиц квантования (`artifacts.py`, PIL), шум
+  (`noise_sigma` из `blure_filter`, медиана отклика Иммеркера; при шуме перед градиентами — медианный фильтр 3×3).
+  Пиксельная «блочность» проверялась и отброшена: веб-JPEG q75–90 по ней неотличимы от q12.
+- `score_calculator`: плавные штрафы, потолки групп пропорциональные. Пороги `SHARP_OK`, `FILL_OK` импортирует LLM-промпт.
+- PNG с прозрачностью читаются на белом фоне (`main._read_image`).
+- LLM (qwen2.5:3b, temperature 0.7) изредка не пишет раздел «Рекомендации» — тогда `stream_recommendations`
+  дописывает его из `issues` (`_FALLBACK_TIPS`). Шум и качество JPEG показываются в блоке метрик, но не идут в промпт.
+- Проверка: тесты `test_ml.ScoringBehaviourTest`; ручной прогон на наборах фото (резкие/размытые/тёмные/пересвеченные,
+  +1.5/+2.5 EV, JPEG q12, шум, 600 px) с сравнением версий по JSON-результатам.
 
 ## БД (PostgreSQL 16)
 - `analysis_results` — проверка: метрики, `issues`/`penalties` (JSONB), `ai_recommendations`, `storage_filename`,

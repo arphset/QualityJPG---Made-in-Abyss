@@ -59,20 +59,20 @@ def detect_objects_yolo(image):
     all_centers_x = []
     all_centers_y = []
 
-    # ✅ НОВОЕ: создаём список для bounding boxes
     boxes_list = []
+    confidences = []
+    union_mask = np.zeros((h, w), dtype=bool)
 
     for box in results[0].boxes:
         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
         conf = float(box.conf[0].cpu().numpy())
 
-        # ✅ НОВОЕ: добавляем координаты в список
         boxes_list.append((int(x1), int(y1), int(x2), int(y2)))
+        confidences.append(conf)
+        union_mask[int(y1):int(y2), int(x1):int(x2)] = True
 
         obj_area = (x2 - x1) * (y2 - y1)
         fill_rate = obj_area / image_area
-
-        total_fill_rate += fill_rate
         object_count += 1
 
         obj_cx = (x1 + x2) / 2
@@ -84,6 +84,9 @@ def detect_objects_yolo(image):
             max_fill_rate = fill_rate
             max_confidence = conf
             object_found = True
+
+    # Площадь объединения рамок: раньше площади складывались и пересекающиеся рамки давали >100%
+    total_fill_rate = float(union_mask.mean()) if object_count else 0.0
 
     # Проверка центрирования группы объектов
     group_cx = np.mean(all_centers_x) if all_centers_x else img_cx
@@ -127,5 +130,6 @@ def detect_objects_yolo(image):
         "is_off_center": is_off_center,
         "composition_bad": composition_bad,
         "issues_comp": issues_comp,
-        "boxes": boxes_list  # ✅ Теперь boxes_list определён
+        "boxes": boxes_list,
+        "confidences": confidences,
     }

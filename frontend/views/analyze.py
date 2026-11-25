@@ -68,9 +68,10 @@ if uploaded_file:
         with col2:
             st.subheader("⚙️ Параметры анализа")
             st.write("Система проверит:")
-            st.info("🔍 Резкость и текстуру (ACF + Laplacian)")
-            st.info("💡 Экспозицию и баланс света")
+            st.info("🔍 Резкость и смаз (ширина краёв)")
+            st.info("💡 Экспозицию: темно, пересвет, засветка")
             st.info("📐 Композицию и заполнение кадра")
+            st.info("🗂️ Качество файла: разрешение, сжатие, шум")
 
         # Кнопка с уникальным ключом
         analyze_button = st.button(
@@ -145,30 +146,33 @@ if uploaded_file:
 
                     # Первая строка: основные метрики
                     m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("ACF Score", f"{analysis_result['acf_score']:.3f}")
+                    m1.metric("Ширина краёв", f"{analysis_result.get('edge_width', 0):.2f} px",
+                              help="Сколько пикселей занимает перепад яркости на краю. Резкое фото — до ~2.8 px, "
+                                   "размытое — от ~4 px.")
                     m2.metric("Яркость", f"{analysis_result['brightness']:.0f}")
                     m3.metric("Заполнение", f"{analysis_result['fill_rate']*100:.1f}%")
                     m4.metric("Индекс чёткости", f"{analysis_result.get('sharpness_score', 0):.2f}")
 
                     # Вторая строка: расширенные метрики резкости
                     st.markdown("---")
-                    st.markdown("#### 🔬 Метрики резкости")
+                    st.markdown("#### 🔬 Качество файла и объект")
 
                     r1, r2, r3 = st.columns(3)
                     r1.metric(
-                        "Лапласиан (глобальный)",
-                        f"{analysis_result.get('laplacian_var', 0):.0f}",
-                        help="Дисперсия лапласиана по всему изображению. Высокое значение = много текстур."
+                        "Цифровой шум",
+                        f"{analysis_result.get('noise_sigma', 0):.1f}",
+                        help="Оценка шума по самым гладким участкам кадра. Норма — до 1.6."
                     )
+                    jpeg_q = analysis_result.get('jpeg_quality') or 0
                     r2.metric(
-                        "Лапласиан (локальный, медиана)",
-                        f"{analysis_result.get('median_laplacian', 0):.0f}",
-                        help="Медиана лапласиана по блокам 64x64. Устойчива к тёмным/светлым фонам."
+                        "Качество JPEG",
+                        f"{jpeg_q:.0f}" if jpeg_q else "не JPEG",
+                        help="Читается из таблиц квантования файла. Ниже ~55 заметны «квадратики» сжатия."
                     )
                     r3.metric(
-                        "Вариация градиента Собеля",
-                        f"{analysis_result.get('sobel_var', 0):.0f}",
-                        help="Измеряет чёткость краёв объектов. Лучше лапласиана для тёмных фото."
+                        "Как выделен объект",
+                        analysis_result.get('subject_method', '—'),
+                        help="Однородный фон / YOLO / центральная область (приблизительно) / не выделен."
                     )
 
                     # Третья строка: экспозиция
